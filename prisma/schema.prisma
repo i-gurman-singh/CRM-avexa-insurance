@@ -1,0 +1,1258 @@
+// ---------------------------------------------------------------------------
+// Insurance CRM — PostgreSQL schema
+//
+// Design notes
+//  * Anything the business will want to change later (stages, insurance
+//    companies, lead sources, document types, lost reasons, task types, age
+//    groups, quote statuses) is a ROW in a lookup table, not an enum.
+//  * Enums are reserved for things that are structural to the code itself
+//    (message direction, job status, provenance source) and would require a
+//    code change to extend anyway.
+//  * Every entity that AI can touch records provenance so staff can always
+//    tell AI-extracted from staff-verified from manually-entered data.
+//  * `customFields Json` on the major entities lets new business fields be
+//    added through Settings without a migration; promote them to real columns
+//    later if they become load-bearing.
+// ---------------------------------------------------------------------------
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "esm"
+}
+
+// Prisma 7: the connection URL lives in prisma.config.ts (CLI) and is passed
+// to the driver adapter at runtime (src/lib/db.ts).
+datasource db {
+  provider = "postgresql"
+}
+
+// ===========================================================================
+// Enums (structural only)
+// ===========================================================================
+
+enum UserRole {
+  ADMINISTRATOR
+  BROKER
+  AGENT
+  ASSISTANT
+}
+
+enum StageCategory {
+  OPEN
+  WON
+  LOST
+  DORMANT
+}
+
+enum MessageDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum MessageChannel {
+  WHATSAPP
+  EMAIL
+  SMS
+  INTERNAL
+}
+
+enum MessageContentType {
+  TEXT
+  IMAGE
+  DOCUMENT
+  AUDIO
+  VIDEO
+  LOCATION
+  CONTACT
+  STICKER
+  TEMPLATE
+  SYSTEM
+  UNKNOWN
+}
+
+enum MessageDeliveryStatus {
+  PENDING
+  SENT
+  DELIVERED
+  READ
+  FAILED
+}
+
+enum FieldSource {
+  MANUAL // typed by a human
+  AI_EXTRACTED // proposed by AI, not yet verified
+  STAFF_VERIFIED // AI proposed, human confirmed
+  IMPORTED // migrated in from another system
+  SYSTEM // derived by the CRM itself (e.g. age from DOB)
+}
+
+enum DocumentProcessingStatus {
+  PENDING
+  PROCESSING
+  PROCESSED
+  FAILED
+  SKIPPED
+}
+
+enum DocumentVerificationStatus {
+  UNVERIFIED
+  VERIFIED
+  REJECTED
+  NEEDS_REVIEW
+}
+
+enum ChecklistItemStatus {
+  NOT_REQUESTED
+  REQUESTED
+  RECEIVED
+  VERIFIED
+  WAIVED
+}
+
+enum TaskStatus {
+  OPEN
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum Priority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+enum FollowUpStatus {
+  SCHEDULED
+  DONE
+  SNOOZED
+  CANCELLED
+}
+
+enum PolicyStatus {
+  DRAFT
+  PENDING_DOCUMENTS
+  SUBMITTED
+  ACTIVE
+  CANCELLED
+  LAPSED
+  RENEWED
+}
+
+enum JobStatus {
+  QUEUED
+  RUNNING
+  SUCCEEDED
+  FAILED
+  DEAD
+}
+
+enum SuggestionStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+  AUTO_APPLIED
+  EXPIRED
+}
+
+enum SuggestionKind {
+  STAGE_CHANGE
+  CREATE_TASK
+  CREATE_FOLLOW_UP
+  REQUEST_DOCUMENT
+  FIELD_UPDATE
+  REPLY_DRAFT
+  TAG_CONVERSATION
+}
+
+enum NotificationSeverity {
+  INFO
+  SUCCESS
+  WARNING
+  CRITICAL
+}
+
+enum ConversationState {
+  ACTIVE
+  WAITING_ON_CLIENT
+  WAITING_ON_US
+  SNOOZED
+  CLOSED
+}
+
+// ===========================================================================
+// Users, auth, audit
+// ===========================================================================
+
+model User {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  name         String
+  passwordHash String
+  role         UserRole @default(AGENT)
+  phone        String?
+  avatarUrl    String?
+  isActive     Boolean  @default(true)
+  lastLoginAt  DateTime?
+  // Per-user permission overrides on top of the role defaults.
+  // e.g. { "documents.download": true }
+  permissionOverrides Json @default("{}")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  assignedClients   Client[]       @relation("ClientAssignee")
+  createdClients    Client[]       @relation("ClientCreator")
+  assignedTasks     Task[]         @relation("TaskAssignee")
+  createdTasks      Task[]         @relation("TaskCreator")
+  assignedFollowUps FollowUp[]     @relation("FollowUpAssignee")
+  notes             Note[]
+  notifications     Notification[]
+  auditLogs         AuditLog[]
+  messages          Message[]      @relation("MessageSender")
+  verifiedDocuments Document[]     @relation("DocumentVerifier")
+  quoteRecords      Quote[]        @relation("QuoteCreator")
+  activityEvents    ActivityEvent[]
+  reviewedSuggestions AiSuggestion[] @relation("SuggestionReviewer")
+  fieldProvenances  FieldProvenance[] @relation("ProvenanceVerifier")
+
+  @@index([role, isActive])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?
+  user       User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action     String // e.g. "client.update", "document.download"
+  entityType String
+  entityId   String?
+  // Redacted diff — never store raw document bytes or full PII payloads here.
+  metadata   Json     @default("{}")
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  @@index([entityType, entityId, createdAt])
+  @@index([userId, createdAt])
+  @@index([action, createdAt])
+}
+
+// ===========================================================================
+// Configurable lookups — everything here is editable in Settings
+// ===========================================================================
+
+model PipelineStage {
+  id          String        @id @default(cuid())
+  key         String        @unique // stable programmatic key, e.g. "ready_to_bind"
+  name        String
+  description String?
+  category    StageCategory @default(OPEN)
+  color       String        @default("#64748b")
+  position    Int
+  isDefault   Boolean       @default(false) // stage new leads land in
+  isActive    Boolean       @default(true)
+  // Optional SLA: flag the client if they sit here longer than N hours.
+  staleAfterHours Int?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  clients      Client[]
+  fromHistory  ClientStageHistory[] @relation("StageFrom")
+  toHistory    ClientStageHistory[] @relation("StageTo")
+
+  @@index([position])
+}
+
+model InsuranceCompany {
+  id        String   @id @default(cuid())
+  name      String   @unique
+  code      String?  @unique
+  isActive  Boolean  @default(true)
+  position  Int      @default(0)
+  notes     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  quotes   Quote[]
+  policies Policy[]
+}
+
+model LeadSource {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  name      String
+  isActive  Boolean  @default(true)
+  position  Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  clients Client[]
+}
+
+model LostReason {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  name      String
+  isActive  Boolean  @default(true)
+  position  Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  clients Client[]
+}
+
+model DocumentType {
+  id          String   @id @default(cuid())
+  key         String   @unique // "drivers_licence", "vehicle_ownership", ...
+  name        String
+  description String?
+  // Which AI extraction routine to run, if any. Null = store only.
+  extractorKey String?
+  // Is this document required before binding, by default?
+  requiredByDefault Boolean @default(false)
+  // Free-text message the CRM uses when asking the client for this document.
+  requestTemplate String?
+  isActive    Boolean  @default(true)
+  position    Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  documents      Document[]
+  checklistItems DocumentChecklistItem[]
+  requirements   DocumentRequirement[]
+}
+
+/// A rule: "for product X, document Y is required at stage Z".
+model DocumentRequirement {
+  id             String   @id @default(cuid())
+  documentTypeId String
+  documentType   DocumentType @relation(fields: [documentTypeId], references: [id], onDelete: Cascade)
+  productKey     String   @default("auto") // auto | home | tenant | commercial | travel
+  required       Boolean  @default(true)
+  // Requirement kicks in when the client reaches this stage (by key).
+  requiredFromStageKey String?
+  position       Int      @default(0)
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([documentTypeId, productKey])
+}
+
+model TaskType {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  name      String
+  defaultPriority Priority @default(NORMAL)
+  // Default number of days from creation to due date.
+  defaultDueInDays Int    @default(1)
+  isActive  Boolean  @default(true)
+  position  Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  tasks Task[]
+}
+
+model QuoteStatus {
+  id         String   @id @default(cuid())
+  key        String   @unique
+  name       String
+  // Does a quote in this status count as "provided to the client"?
+  isProvided Boolean  @default(false)
+  isClosed   Boolean  @default(false)
+  color      String   @default("#64748b")
+  isActive   Boolean  @default(true)
+  position   Int      @default(0)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  quotes Quote[]
+}
+
+model AgeGroup {
+  id        String   @id @default(cuid())
+  name      String   @unique // "26-30"
+  minAge    Int
+  maxAge    Int? // null = no upper bound
+  position  Int      @default(0)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// Generic key/value store for everything else configurable.
+model Setting {
+  key         String   @id
+  value       Json
+  category    String   @default("general")
+  label       String?
+  description String?
+  updatedAt   DateTime @updatedAt
+
+  @@index([category])
+}
+
+/// Lets admins add new client/driver/vehicle fields without a migration.
+/// Values land in the entity's `customFields` JSON column.
+model CustomFieldDefinition {
+  id          String   @id @default(cuid())
+  entity      String // "client" | "driver" | "vehicle" | "quote" | "policy"
+  key         String
+  label       String
+  // text | number | date | boolean | select | multiselect | phone | email
+  fieldType   String   @default("text")
+  options     Json     @default("[]")
+  required    Boolean  @default(false)
+  helpText    String?
+  position    Int      @default(0)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([entity, key])
+  @@index([entity, position])
+}
+
+// ===========================================================================
+// Clients & related records
+// ===========================================================================
+
+model Client {
+  id          String   @id @default(cuid())
+  // Human-friendly reference shown in the UI and quoted to clients.
+  reference   Int      @unique @default(autoincrement())
+
+  firstName   String?
+  lastName    String?
+  displayName String // always populated; falls back to phone number
+  email       String?
+  /// E.164, digits only with leading +. Unique because WhatsApp routing keys on it.
+  phone       String   @unique
+  altPhone    String?
+  dateOfBirth DateTime?
+  maritalStatus String?
+  preferredLanguage String @default("en")
+
+  addressLine1 String?
+  addressLine2 String?
+  city         String?
+  province     String?  @default("ON")
+  postalCode   String?
+  country      String?  @default("CA")
+
+  stageId      String
+  stage        PipelineStage @relation(fields: [stageId], references: [id])
+  stageEnteredAt DateTime    @default(now())
+
+  leadSourceId String?
+  leadSource   LeadSource? @relation(fields: [leadSourceId], references: [id], onDelete: SetNull)
+
+  lostReasonId String?
+  lostReason   LostReason? @relation(fields: [lostReasonId], references: [id], onDelete: SetNull)
+  lostNotes    String?
+
+  assignedUserId String?
+  assignedUser   User?  @relation("ClientAssignee", fields: [assignedUserId], references: [id], onDelete: SetNull)
+
+  createdByUserId String?
+  createdByUser   User?  @relation("ClientCreator", fields: [createdByUserId], references: [id], onDelete: SetNull)
+
+  /// Products this client is being quoted for: ["auto","tenant"]
+  products     String[] @default(["auto"])
+
+  tags         String[] @default([])
+  customFields Json     @default("{}")
+
+  /// Denormalised for cheap list/dashboard queries. Maintained by the
+  /// messaging service — never write these from the UI directly.
+  lastInboundAt   DateTime?
+  lastOutboundAt  DateTime?
+  lastActivityAt  DateTime  @default(now())
+  unreadCount     Int       @default(0)
+  needsAttention  Boolean   @default(false)
+  attentionReason String?
+
+  isArchived Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  drivers        Driver[]
+  vehicles       Vehicle[]
+  quotes         Quote[]
+  policies       Policy[]
+  documents      Document[]
+  tasks          Task[]
+  followUps      FollowUp[]
+  notes          Note[]
+  conversations  Conversation[]
+  messages       Message[]
+  activityEvents ActivityEvent[]
+  stageHistory   ClientStageHistory[]
+  checklistItems DocumentChecklistItem[]
+  suggestions    AiSuggestion[]
+  notifications  Notification[]
+
+  @@index([stageId, lastActivityAt])
+  @@index([assignedUserId, lastActivityAt])
+  @@index([needsAttention, lastActivityAt])
+  @@index([createdAt])
+  @@index([lastName, firstName])
+  @@index([email])
+}
+
+model ClientStageHistory {
+  id          String   @id @default(cuid())
+  clientId    String
+  client      Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  fromStageId String?
+  fromStage   PipelineStage? @relation("StageFrom", fields: [fromStageId], references: [id], onDelete: SetNull)
+  toStageId   String
+  toStage     PipelineStage  @relation("StageTo", fields: [toStageId], references: [id])
+  changedByUserId String?
+  /// "manual" | "ai" | "workflow" | "system"
+  changedBy   String   @default("manual")
+  reason      String?
+  confidence  Float?
+  /// Seconds the client spent in the previous stage — powers funnel timing analytics.
+  durationSeconds Int?
+  createdAt   DateTime @default(now())
+
+  @@index([clientId, createdAt])
+  @@index([toStageId, createdAt])
+}
+
+model Driver {
+  id        String   @id @default(cuid())
+  clientId  String
+  client    Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  firstName String?
+  lastName  String?
+  fullName  String
+  relationship String? // primary | spouse | child | other
+  isPrimary Boolean  @default(false)
+  dateOfBirth DateTime?
+  gender    String?
+  maritalStatus String?
+
+  licenceNumber String?
+  licenceClass  String?
+  licenceProvince String? @default("ON")
+  licenceExpiry DateTime?
+  g1Date        DateTime?
+  g2Date        DateTime?
+  gDate         DateTime?
+  driverTraining Boolean @default(false)
+  driverTrainingDate DateTime?
+  yearsLicensed Int?
+  internationalExperienceYears Int?
+  internationalExperienceCountry String?
+  occupation    String?
+
+  customFields Json @default("{}")
+  notes        String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  convictions DriverConviction[]
+  claims      DriverClaim[]
+
+  @@index([clientId])
+  @@index([licenceNumber])
+}
+
+model DriverConviction {
+  id          String   @id @default(cuid())
+  driverId    String
+  driver      Driver   @relation(fields: [driverId], references: [id], onDelete: Cascade)
+  description String
+  /// minor | major | criminal
+  severity    String   @default("minor")
+  convictionDate DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([driverId])
+}
+
+model DriverClaim {
+  id          String   @id @default(cuid())
+  driverId    String
+  driver      Driver   @relation(fields: [driverId], references: [id], onDelete: Cascade)
+  description String
+  claimDate   DateTime?
+  /// at_fault | not_at_fault | partial | comprehensive
+  faultType   String   @default("not_at_fault")
+  amount      Decimal? @db.Decimal(12, 2)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([driverId])
+}
+
+model Vehicle {
+  id       String   @id @default(cuid())
+  clientId String
+  client   Client   @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  vin        String?
+  year       Int?
+  make       String?
+  model      String?
+  trim       String?
+  plate      String?
+  /// owned | financed | leased
+  ownership  String?
+  /// pleasure | commute | business
+  usage      String?
+  annualKilometres Int?
+  commuteOneWayKm  Int?
+  winterTires Boolean @default(false)
+  antiTheftDevice Boolean @default(false)
+  purchaseDate DateTime?
+  purchaseCondition String? // new | used
+  lienholder String?
+  primaryDriverId String?
+
+  customFields Json @default("{}")
+  notes        String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([clientId])
+  @@index([vin])
+}
+
+// ===========================================================================
+// Quotes & policies
+// ===========================================================================
+
+model Quote {
+  id       String @id @default(cuid())
+  clientId String
+  client   Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  insuranceCompanyId String
+  insuranceCompany   InsuranceCompany @relation(fields: [insuranceCompanyId], references: [id])
+
+  statusId String
+  status   QuoteStatus @relation(fields: [statusId], references: [id])
+
+  productKey String @default("auto")
+
+  quoteDate  DateTime @default(now())
+  expiresAt  DateTime?
+
+  monthlyPremium Decimal? @db.Decimal(12, 2)
+  annualPremium  Decimal? @db.Decimal(12, 2)
+  currency       String   @default("CAD")
+
+  coverageType   String? // liability_only | standard | full
+  liabilityLimit Decimal? @db.Decimal(14, 2)
+  collisionDeductible Decimal? @db.Decimal(12, 2)
+  comprehensiveDeductible Decimal? @db.Decimal(12, 2)
+  telematics     Boolean  @default(false)
+  bundleType     String? // none | tenant | home | condo
+  bundleDiscount Decimal? @db.Decimal(12, 2)
+
+  /// e.g. [{"name":"Multi-vehicle","amount":45}]
+  discounts Json @default("[]")
+  /// Free-form coverage detail so new options don't need a migration.
+  coverageDetails Json @default("{}")
+  customFields    Json @default("{}")
+
+  isSelected Boolean @default(false)
+  selectedAt DateTime?
+  sentToClientAt DateTime?
+
+  notes String?
+
+  createdByUserId String?
+  createdByUser   User? @relation("QuoteCreator", fields: [createdByUserId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  policy Policy?
+
+  @@index([clientId, quoteDate])
+  @@index([insuranceCompanyId, quoteDate])
+  @@index([statusId])
+}
+
+model Policy {
+  id       String @id @default(cuid())
+  clientId String
+  client   Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  quoteId String? @unique
+  quote   Quote?  @relation(fields: [quoteId], references: [id], onDelete: SetNull)
+
+  insuranceCompanyId String
+  insuranceCompany   InsuranceCompany @relation(fields: [insuranceCompanyId], references: [id])
+
+  policyNumber String?
+  productKey   String       @default("auto")
+  status       PolicyStatus @default(DRAFT)
+
+  effectiveDate DateTime?
+  expiryDate    DateTime?
+  renewalDate   DateTime?
+
+  monthlyPremium Decimal? @db.Decimal(12, 2)
+  annualPremium  Decimal? @db.Decimal(12, 2)
+  commissionRate Decimal? @db.Decimal(6, 4)
+  commissionAmount Decimal? @db.Decimal(12, 2)
+
+  paymentMethod String? // monthly_pad | annual | credit_card
+  boundAt       DateTime?
+  boundByUserId String?
+
+  customFields Json @default("{}")
+  notes        String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([clientId])
+  @@index([status, effectiveDate])
+  @@index([renewalDate])
+  @@index([policyNumber])
+}
+
+// ===========================================================================
+// Messaging (WhatsApp-first, but channel-agnostic)
+// ===========================================================================
+
+model Conversation {
+  id       String @id @default(cuid())
+  clientId String
+  client   Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  channel  MessageChannel @default(WHATSAPP)
+  /// Channel-specific address: the WhatsApp phone number / email address.
+  externalId String
+  /// Which of our numbers/inboxes this conversation belongs to. Supports
+  /// multiple WhatsApp numbers later without a schema change.
+  inboxId  String  @default("default")
+
+  state    ConversationState @default(ACTIVE)
+  isPinned Boolean @default(false)
+  priority Priority @default(NORMAL)
+  /// AI/staff-applied labels: ["price_objection","ready_to_bind"]
+  labels   String[] @default([])
+
+  unreadCount    Int       @default(0)
+  lastMessageAt  DateTime?
+  lastInboundAt  DateTime?
+  lastOutboundAt DateTime?
+  snoozedUntil   DateTime?
+  /// Set when AI confidence on the latest message was below threshold.
+  aiUncertain    Boolean   @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  messages Message[]
+
+  @@unique([channel, externalId, inboxId])
+  @@index([clientId])
+  @@index([state, lastMessageAt])
+  @@index([unreadCount, lastMessageAt])
+}
+
+model Message {
+  id             String @id @default(cuid())
+  conversationId String
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  clientId       String
+  client         Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  /// Provider message id. Unique per channel — this is our webhook dedupe key.
+  externalId String?
+  channel    MessageChannel   @default(WHATSAPP)
+  direction  MessageDirection
+  contentType MessageContentType @default(TEXT)
+
+  /// Original, unmodified text exactly as received. Never overwritten by AI.
+  body       String?
+  /// Verbatim provider payload, stored BEFORE any processing happens.
+  rawPayload Json @default("{}")
+
+  /// For OUTBOUND messages sent by a human.
+  sentByUserId String?
+  sentByUser   User?  @relation("MessageSender", fields: [sentByUserId], references: [id], onDelete: SetNull)
+  /// True when the CRM (not a person) sent it.
+  isAutomated  Boolean @default(false)
+
+  deliveryStatus MessageDeliveryStatus @default(PENDING)
+  errorMessage   String?
+
+  /// Provider timestamp; falls back to receive time.
+  sentAt     DateTime
+  deliveredAt DateTime?
+  readAt     DateTime?
+  isRead     Boolean  @default(false)
+
+  /// Voice-note / media metadata: duration, mime type, filename, caption.
+  mediaMeta  Json @default("{}")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  attachments MessageAttachment[]
+  analysis    MessageAnalysis?
+  documents   Document[]
+  suggestions AiSuggestion[]
+
+  @@unique([channel, externalId])
+  @@index([conversationId, sentAt])
+  @@index([clientId, sentAt])
+  @@index([direction, sentAt])
+}
+
+model MessageAttachment {
+  id        String  @id @default(cuid())
+  messageId String
+  message   Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  /// Provider media id, used to fetch the binary.
+  externalMediaId String?
+  mimeType  String?
+  filename  String?
+  sizeBytes Int?
+  /// Storage key in S3/local. Never a public URL.
+  storageKey String?
+  sha256     String?
+  downloadStatus DocumentProcessingStatus @default(PENDING)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  document Document?
+
+  @@index([messageId])
+}
+
+/// Idempotency ledger for inbound webhooks. Written inside the same
+/// transaction that persists the message, so a replayed delivery is a no-op.
+model WebhookEvent {
+  id          String   @id @default(cuid())
+  provider    String // "360dialog"
+  /// Provider's event/message id. Unique constraint is the dedupe guarantee.
+  externalId  String
+  eventType   String
+  payload     Json
+  processedAt DateTime?
+  error       String?
+  receivedAt  DateTime @default(now())
+
+  @@unique([provider, externalId])
+  @@index([receivedAt])
+}
+
+// ===========================================================================
+// AI
+// ===========================================================================
+
+/// One row per inbound message that has been through the understanding pass.
+model MessageAnalysis {
+  id        String  @id @default(cuid())
+  messageId String  @unique
+  message   Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+
+  /// Canonical intent key — see src/core/ai/intents.ts
+  intent     String
+  confidence Float
+  sentiment  String? // positive | neutral | negative
+  urgency    Priority @default(NORMAL)
+  language   String?
+  /// Structured extraction: {"vehicles":[...],"budget":..., "requestedCompany":...}
+  entities   Json    @default("{}")
+  /// Secondary intents with their own scores.
+  secondaryIntents Json @default("[]")
+  summary    String?
+
+  provider    String
+  model       String
+  promptVersion String @default("v1")
+  latencyMs   Int?
+  tokensUsed  Int?
+  error       String?
+
+  createdAt DateTime @default(now())
+
+  @@index([intent, createdAt])
+  @@index([confidence])
+}
+
+/// Everything AI proposes lands here first. Business rules (not the model)
+/// decide whether it auto-applies or waits for a human.
+model AiSuggestion {
+  id        String @id @default(cuid())
+  clientId  String
+  client    Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+  messageId String?
+  message   Message? @relation(fields: [messageId], references: [id], onDelete: SetNull)
+  documentId String?
+  document   Document? @relation(fields: [documentId], references: [id], onDelete: SetNull)
+
+  kind       SuggestionKind
+  status     SuggestionStatus @default(PENDING)
+  confidence Float
+  /// Kind-specific body, e.g. {"toStageKey":"ready_to_bind"} or
+  /// {"field":"driver.licenceNumber","value":"...","driverId":"..."}
+  payload    Json
+  rationale  String?
+
+  reviewedByUserId String?
+  reviewedByUser   User?   @relation("SuggestionReviewer", fields: [reviewedByUserId], references: [id], onDelete: SetNull)
+  reviewedAt       DateTime?
+  reviewNotes      String?
+
+  /// Set when a rule auto-applied it, naming the rule for traceability.
+  appliedByRule String?
+
+  expiresAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([clientId, status])
+  @@index([status, kind, createdAt])
+}
+
+/// Tracks, per field, where the current value came from and whether a human
+/// has signed off on it. This is what makes "AI extracted vs staff verified
+/// vs manually entered" visible in the UI.
+model FieldProvenance {
+  id         String @id @default(cuid())
+  entityType String // "client" | "driver" | "vehicle"
+  entityId   String
+  fieldPath  String // "licenceNumber", "customFields.brokerNote"
+
+  source     FieldSource
+  confidence Float?
+  /// Where it came from: document id, message id, or user id.
+  sourceRef  String?
+
+  verifiedByUserId String?
+  verifiedByUser   User?  @relation("ProvenanceVerifier", fields: [verifiedByUserId], references: [id], onDelete: SetNull)
+  verifiedAt       DateTime?
+
+  /// Kept so staff can see what the value was replaced with.
+  previousValue Json?
+  currentValue  Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([entityType, entityId, fieldPath])
+  @@index([entityType, entityId])
+  @@index([source])
+}
+
+// ===========================================================================
+// Documents
+// ===========================================================================
+
+model Document {
+  id       String @id @default(cuid())
+  clientId String
+  client   Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  documentTypeId String?
+  documentType   DocumentType? @relation(fields: [documentTypeId], references: [id], onDelete: SetNull)
+
+  /// Where it came from.
+  messageId    String?
+  message      Message? @relation(fields: [messageId], references: [id], onDelete: SetNull)
+  attachmentId String?  @unique
+  attachment   MessageAttachment? @relation(fields: [attachmentId], references: [id], onDelete: SetNull)
+  /// whatsapp | upload | email | generated
+  source       String   @default("whatsapp")
+  uploadedByUserId String?
+
+  filename  String
+  mimeType  String
+  sizeBytes Int
+  /// Private object key. Access is always via a short-lived signed URL.
+  storageKey String
+  sha256     String?
+  pageCount  Int?
+
+  receivedAt DateTime @default(now())
+
+  processingStatus   DocumentProcessingStatus   @default(PENDING)
+  verificationStatus DocumentVerificationStatus @default(UNVERIFIED)
+  /// AI's own guess at the document type, before staff confirm it.
+  detectedTypeKey       String?
+  detectionConfidence   Float?
+
+  verifiedByUserId String?
+  verifiedByUser   User?  @relation("DocumentVerifier", fields: [verifiedByUserId], references: [id], onDelete: SetNull)
+  verifiedAt       DateTime?
+  rejectionReason  String?
+
+  notes String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  extractions    DocumentExtraction[]
+  checklistItems DocumentChecklistItem[]
+  suggestions    AiSuggestion[]
+
+  @@index([clientId, receivedAt])
+  @@index([processingStatus])
+  @@index([verificationStatus])
+  @@index([documentTypeId])
+}
+
+/// One AI pass over a document. Kept as history — re-running extraction
+/// creates a new row rather than destroying the old one.
+model DocumentExtraction {
+  id         String   @id @default(cuid())
+  documentId String
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  extractorKey String // "drivers_licence" | "vehicle_ownership" | "generic"
+  provider     String
+  model        String
+  promptVersion String @default("v1")
+
+  /// {"licenceNumber":{"value":"A1234-...","confidence":0.94}, ...}
+  fields     Json    @default("{}")
+  rawResponse Json   @default("{}")
+  confidence Float?
+  warnings   String[] @default([])
+  error      String?
+
+  latencyMs  Int?
+  tokensUsed Int?
+
+  /// Set once staff have accepted/rejected this extraction into client data.
+  appliedAt       DateTime?
+  appliedByUserId String?
+
+  createdAt DateTime @default(now())
+
+  @@index([documentId, createdAt])
+}
+
+/// Per-client checklist of what we still need from them.
+model DocumentChecklistItem {
+  id       String @id @default(cuid())
+  clientId String
+  client   Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  documentTypeId String
+  documentType   DocumentType @relation(fields: [documentTypeId], references: [id], onDelete: Cascade)
+
+  status     ChecklistItemStatus @default(NOT_REQUESTED)
+  required   Boolean @default(true)
+  requestedAt DateTime?
+  requestCount Int    @default(0)
+  lastRequestedAt DateTime?
+  receivedAt DateTime?
+
+  /// The document that satisfied this item.
+  documentId String?
+  document   Document? @relation(fields: [documentId], references: [id], onDelete: SetNull)
+
+  waivedByUserId String?
+  waivedReason   String?
+
+  notes String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([clientId, documentTypeId])
+  @@index([clientId, status])
+  @@index([status, required])
+}
+
+// ===========================================================================
+// Work management
+// ===========================================================================
+
+model Task {
+  id       String  @id @default(cuid())
+  clientId String?
+  client   Client? @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  taskTypeId String?
+  taskType   TaskType? @relation(fields: [taskTypeId], references: [id], onDelete: SetNull)
+
+  title       String
+  description String?
+  status      TaskStatus @default(OPEN)
+  priority    Priority   @default(NORMAL)
+
+  dueAt       DateTime?
+  completedAt DateTime?
+  completedByUserId String?
+
+  assignedUserId String?
+  assignedUser   User?  @relation("TaskAssignee", fields: [assignedUserId], references: [id], onDelete: SetNull)
+
+  createdByUserId String?
+  createdByUser   User?  @relation("TaskCreator", fields: [createdByUserId], references: [id], onDelete: SetNull)
+
+  /// "manual" | "ai" | "workflow:<rule-key>"
+  createdBySystem String @default("manual")
+  /// Prevents a workflow from re-creating a task it already created.
+  dedupeKey       String?
+
+  notes String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([dedupeKey])
+  @@index([status, dueAt])
+  @@index([assignedUserId, status, dueAt])
+  @@index([clientId, status])
+}
+
+model FollowUp {
+  id       String @id @default(cuid())
+  clientId String
+  client   Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  /// Configurable reason key, e.g. "price_objection", "no_response".
+  reasonKey String
+  reason    String?
+  status    FollowUpStatus @default(SCHEDULED)
+  priority  Priority       @default(NORMAL)
+
+  dueAt     DateTime
+  completedAt DateTime?
+  snoozedUntil DateTime?
+  outcome   String?
+
+  assignedUserId String?
+  assignedUser   User?  @relation("FollowUpAssignee", fields: [assignedUserId], references: [id], onDelete: SetNull)
+
+  createdBySystem String @default("manual")
+  dedupeKey       String?
+
+  notes String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([dedupeKey])
+  @@index([status, dueAt])
+  @@index([assignedUserId, status, dueAt])
+  @@index([clientId, status])
+}
+
+model Note {
+  id       String @id @default(cuid())
+  clientId String
+  client   Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  authorId String?
+  author   User?  @relation(fields: [authorId], references: [id], onDelete: SetNull)
+
+  body     String
+  isPinned Boolean @default(false)
+  /// Internal-only by definition; the flag exists so a future client portal
+  /// can surface a subset without a migration.
+  isInternal Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([clientId, isPinned, createdAt])
+}
+
+/// Append-only client history. Written by services, never edited.
+model ActivityEvent {
+  id       String @id @default(cuid())
+  clientId String
+  client   Client @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  /// Namespaced key: "client.created", "quote.sent", "document.received"
+  type     String
+  title    String
+  body     String?
+  /// Free-form context for rendering, e.g. {"from":"Quoting","to":"Quote Provided"}
+  metadata Json   @default("{}")
+
+  /// "user" | "ai" | "workflow" | "system" | "client"
+  actorType String @default("system")
+  actorId   String?
+  actorUser User?  @relation(fields: [actorId], references: [id], onDelete: SetNull)
+
+  /// Optional pointer to the record this event is about.
+  entityType String?
+  entityId   String?
+
+  createdAt DateTime @default(now())
+
+  @@index([clientId, createdAt])
+  @@index([type, createdAt])
+}
+
+// ===========================================================================
+// Notifications
+// ===========================================================================
+
+model Notification {
+  id     String @id @default(cuid())
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  clientId String?
+  client   Client? @relation(fields: [clientId], references: [id], onDelete: Cascade)
+
+  /// "lead.new" | "message.received" | "followup.overdue" | "ai.uncertain"
+  type     String
+  severity NotificationSeverity @default(INFO)
+  title    String
+  body     String?
+  linkUrl  String?
+  metadata Json @default("{}")
+
+  readAt   DateTime?
+  /// Collapses repeats: same key within the window updates instead of inserting.
+  groupKey String?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, readAt, createdAt])
+  @@index([groupKey])
+}
+
+// ===========================================================================
+// Background jobs
+// ===========================================================================
+
+/// Durable job ledger. Works standalone (QUEUE_PROVIDER=database) and also
+/// backs SQS mode, so a failed SQS job is still visible and retryable in the UI.
+model Job {
+  id        String    @id @default(cuid())
+  type      String
+  payload   Json
+  status    JobStatus @default(QUEUED)
+  priority  Int       @default(0)
+
+  attempts    Int      @default(0)
+  maxAttempts Int      @default(5)
+  runAt       DateTime @default(now())
+  startedAt   DateTime?
+  finishedAt  DateTime?
+  lockedBy    String?
+  lockedAt    DateTime?
+
+  lastError String?
+  /// Optional idempotency key — a second enqueue with the same key is dropped.
+  dedupeKey String? @unique
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, runAt, priority])
+  @@index([type, status])
+}
